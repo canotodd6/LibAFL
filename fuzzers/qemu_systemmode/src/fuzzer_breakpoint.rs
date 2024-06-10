@@ -13,7 +13,7 @@ use libafl::{
     inputs::BytesInput,
     monitors::MultiMonitor,
     mutators::scheduled::{havoc_mutations, StdScheduledMutator},
-    observers::{HitcountsMapObserver, TimeObserver, VariableMapObserver},
+    observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::{CalibrationStage, StdMutationalStage},
     state::{HasCorpus, StdState},
@@ -22,19 +22,20 @@ use libafl::{
 use libafl_bolts::{
     core_affinity::Cores,
     current_nanos,
+    ownedref::OwnedMutSlice,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
 };
 use libafl_qemu::{
     breakpoint::Breakpoint,
-    command::{Command, EmulatorMemoryChunk, EndCommand, StartCommand},
-    edges::{edges_map_mut_slice, QemuEdgeCoverageHelper, MAX_EDGES_NUM},
+    command::{EndCommand, StartCommand, StdCommandManager},
+    edges::{edges_map_mut_ptr, QemuEdgeCoverageHelper, EDGES_MAP_SIZE_IN_USE, MAX_EDGES_FOUND},
     elf::EasyElf,
     emu::Emulator,
     executor::{stateful::StatefulQemuExecutor, QemuExecutorState},
-    EmuExitReasonError, FastSnapshotManager, GuestPhysAddr, GuestReg, HandlerError, HandlerResult,
-    QemuHooks, StdEmuExitHandler,
+    EmulatorMemoryChunk, FastSnapshotManager, GuestPhysAddr, GuestReg, QemuHooks,
+    StdEmulatorExitHandler,
 };
 
 // use libafl_qemu::QemuSnapshotBuilder; // for normal qemu snapshot
@@ -89,33 +90,32 @@ pub fn fuzz() {
 
         // Choose Snapshot Builder
         // let emu_snapshot_manager = QemuSnapshotBuilder::new(true);
-        let emu_snapshot_manager = FastSnapshotManager::new(false);
+        let emu_snapshot_manager = FastSnapshotManager::new();
 
         // Choose Exit Handler
-        let emu_exit_handler = StdEmuExitHandler::new(emu_snapshot_manager);
+        let emu_exit_handler = StdEmulatorExitHandler::new(emu_snapshot_manager);
+
+        // Choose Command Manager
+        let cmd_manager = StdCommandManager::new();
 
         // Create emulator
-        let emu = Emulator::new(&args, &env, emu_exit_handler).unwrap();
+        let emu = Emulator::new(&args, &env, emu_exit_handler, cmd_manager).unwrap();
 
         // Set breakpoints of interest with corresponding commands.
         emu.add_breakpoint(
             Breakpoint::with_command(
                 main_addr,
-                Command::StartCommand(StartCommand::new(EmulatorMemoryChunk::phys(
+                StartCommand::new(EmulatorMemoryChunk::phys(
                     input_addr,
                     unsafe { MAX_INPUT_SIZE } as GuestReg,
                     None,
-                ))),
+                )),
                 true,
             ),
             true,
         );
         emu.add_breakpoint(
-            Breakpoint::with_command(
-                breakpoint,
-                Command::EndCommand(EndCommand::new(Some(ExitKind::Ok))),
-                false,
-            ),
+            Breakpoint::with_command(breakpoint, EndCommand::new(Some(ExitKind::Ok)), false),
             true,
         );
 
@@ -125,38 +125,20 @@ pub fn fuzz() {
         // The wrapped harness function, calling out to the LLVM-style harness
         let mut harness =
             |input: &BytesInput, qemu_executor_state: &mut QemuExecutorState<_, _>| unsafe {
-                match emu.run(input, qemu_executor_state) {
-                    Ok(handler_result) => match handler_result {
-                        HandlerResult::UnhandledExit(unhandled_exit) => {
-                            panic!("Unhandled exit: {}", unhandled_exit)
-                        }
-                        HandlerResult::EndOfRun(exit_kind) => return exit_kind,
-                        HandlerResult::Interrupted => {
-                            std::process::exit(0);
-                        }
-                    },
-                    Err(handler_error) => match handler_error {
-                        HandlerError::QemuExitReasonError(emu_exit_reason_error) => {
-                            match emu_exit_reason_error {
-                                EmuExitReasonError::UnknownKind => panic!("unknown kind"),
-                                EmuExitReasonError::UnexpectedExit => return ExitKind::Crash,
-                                _ => {
-                                    panic!("Emu Exit unhandled error: {:?}", emu_exit_reason_error)
-                                }
-                            }
-                        }
-                        _ => panic!("Unhandled error: {:?}", handler_error),
-                    },
-                }
+                emu.run(input, qemu_executor_state)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
             };
 
         // Create an observation channel using the coverage map
         let edges_observer = unsafe {
             HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
                 "edges",
-                edges_map_mut_slice(),
-                addr_of_mut!(MAX_EDGES_NUM),
+                OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), EDGES_MAP_SIZE_IN_USE),
+                addr_of_mut!(MAX_EDGES_FOUND),
             ))
+            .track_indices()
         };
 
         // Create an observation channel to keep track of the execution time
@@ -166,9 +148,9 @@ pub fn fuzz() {
         // This one is composed by two Feedbacks in OR
         let mut feedback = feedback_or!(
             // New maximization map feedback linked to the edges observer and the feedback state
-            MaxMapFeedback::tracking(&edges_observer, true, true),
+            MaxMapFeedback::new(&edges_observer),
             // Time feedback, this one does not need a feedback state
-            TimeFeedback::with_observer(&time_observer)
+            TimeFeedback::new(&time_observer)
         );
 
         // A feedback to choose if an input is a solution or not
@@ -194,7 +176,8 @@ pub fn fuzz() {
         });
 
         // A minimization+queue policy to get testcasess from the corpus
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(QueueScheduler::new());
+        let scheduler =
+            IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
 
         // A fuzzer with feedbacks and a corpus scheduler
         let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
@@ -206,7 +189,7 @@ pub fn fuzz() {
 
         // Setup an havoc mutator with a mutational stage
         let mutator = StdScheduledMutator::new(havoc_mutations());
-        let calibration_feedback = MaxMapFeedback::tracking(&edges_observer, true, true);
+        let calibration_feedback = MaxMapFeedback::new(&edges_observer);
         let mut stages = tuple_list!(
             StdMutationalStage::new(mutator),
             CalibrationStage::new(&calibration_feedback)

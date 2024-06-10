@@ -1,5 +1,6 @@
 use alloc::rc::Rc;
 use core::{cell::RefCell, fmt::Debug};
+use std::borrow::Cow;
 
 use libafl::{
     alloc,
@@ -36,8 +37,9 @@ impl LibfuzzerKeepFeedback {
 }
 
 impl Named for LibfuzzerKeepFeedback {
-    fn name(&self) -> &str {
-        "libfuzzer-keep"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("libfuzzer-keep");
+        &NAME
     }
 }
 
@@ -57,6 +59,11 @@ where
         EM: EventFirer<State = S>,
         OT: ObserversTuple<S>,
     {
+        Ok(*self.keep.borrow())
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
         Ok(*self.keep.borrow())
     }
 }
@@ -90,8 +97,9 @@ impl LibfuzzerCrashCauseFeedback {
 }
 
 impl Named for LibfuzzerCrashCauseFeedback {
-    fn name(&self) -> &str {
-        "crash-cause"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("crash-cause");
+        &NAME
     }
 }
 
@@ -128,6 +136,10 @@ where
         OT: ObserversTuple<S>,
     {
         self.exit_kind = *exit_kind;
+        Ok(false)
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
         Ok(false)
     }
 
@@ -171,4 +183,4 @@ where
     }
 }
 
-pub type ShrinkMapFeedback<O, S, T> = MinMapFeedback<MappedEdgeMapObserver<O, T>, S, usize>;
+pub type ShrinkMapFeedback<C, O, T> = MinMapFeedback<C, MappedEdgeMapObserver<O, T>, usize>;

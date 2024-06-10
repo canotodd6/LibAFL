@@ -22,7 +22,7 @@ use libafl::{
     Error, HasScheduler, StdFuzzer,
 };
 use libafl_bolts::{
-    rands::{Rand, RandomSeed, StdRand},
+    rands::{Rand, StdRand},
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
     AsSlice,
@@ -105,7 +105,7 @@ pub fn merge(
     let edges_observer =
         MappedEdgeMapObserver::new(edges_observer, SizeTimeValueObserver::new(time));
 
-    let map_feedback = MinMapFeedback::tracking(&edges_observer, false, true);
+    let map_feedback = MinMapFeedback::new(&edges_observer);
 
     // Create an OOM observer to monitor if an OOM has occurred
     let oom_observer = OomObserver::new(options.rss_limit(), options.malloc_limit());
@@ -236,6 +236,8 @@ pub fn merge(
                     .scheduler_mut()
                     .on_remove(&mut state, idx, &Some(testcase))?;
             } else {
+                // False-positive: file_path is used just below
+                #[allow(clippy::needless_borrows_for_generic_args)]
                 rename(&file_path, &new_file_path)?;
                 *file_path = new_file_path;
             }

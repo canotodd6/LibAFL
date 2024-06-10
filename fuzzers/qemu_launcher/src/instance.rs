@@ -18,7 +18,7 @@ use libafl::{
         scheduled::havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations,
         StdMOptMutator, StdScheduledMutator, Tokens,
     },
-    observers::{HitcountsMapObserver, TimeObserver, VariableMapObserver},
+    observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},
     schedulers::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, PowerQueueScheduler,
     },
@@ -33,14 +33,14 @@ use libafl::{
 use libafl_bolts::shmem::StdShMemProvider;
 use libafl_bolts::{
     core_affinity::CoreId,
-    current_nanos,
+    ownedref::OwnedMutSlice,
     rands::StdRand,
     tuples::{tuple_list, Merge},
 };
 use libafl_qemu::{
     cmplog::CmpLogObserver,
-    edges::{edges_map_mut_slice, MAX_EDGES_NUM},
-    helper::QemuHelperTuple,
+    edges::{edges_map_mut_ptr, EDGES_MAP_SIZE_IN_USE, MAX_EDGES_FOUND},
+    helpers::QemuHelperTuple,
     Qemu, QemuExecutor, QemuHooks,
 };
 use typed_builder::TypedBuilder;
@@ -78,15 +78,16 @@ impl<'a, M: Monitor> Instance<'a, M> {
         let edges_observer = unsafe {
             HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
                 "edges",
-                edges_map_mut_slice(),
-                addr_of_mut!(MAX_EDGES_NUM),
+                OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), EDGES_MAP_SIZE_IN_USE),
+                addr_of_mut!(MAX_EDGES_FOUND),
             ))
+            .track_indices()
         };
 
         // Create an observation channel to keep track of the execution time
         let time_observer = TimeObserver::new("time");
 
-        let map_feedback = MaxMapFeedback::tracking(&edges_observer, true, false);
+        let map_feedback = MaxMapFeedback::new(&edges_observer);
 
         let calibration = CalibrationStage::new(&map_feedback);
 
@@ -96,7 +97,7 @@ impl<'a, M: Monitor> Instance<'a, M> {
             // New maximization map feedback linked to the edges observer and the feedback state
             map_feedback,
             // Time feedback, this one does not need a feedback state
-            TimeFeedback::with_observer(&time_observer)
+            TimeFeedback::new(&time_observer)
         );
 
         // A feedback to choose if an input is a solution or not
@@ -108,7 +109,7 @@ impl<'a, M: Monitor> Instance<'a, M> {
             None => {
                 StdState::new(
                     // RNG
-                    StdRand::with_seed(current_nanos()),
+                    StdRand::new(),
                     // Corpus that will be evolved, we keep it in memory for performance
                     InMemoryOnDiskCorpus::no_meta(self.options.queue_dir(self.core_id))?,
                     // Corpus in which we store solutions (crashes in this example),
@@ -124,11 +125,10 @@ impl<'a, M: Monitor> Instance<'a, M> {
         };
 
         // A minimization+queue policy to get testcasess from the corpus
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(PowerQueueScheduler::new(
-            &mut state,
+        let scheduler = IndexesLenTimeMinimizerScheduler::new(
             &edges_observer,
-            PowerSchedule::FAST,
-        ));
+            PowerQueueScheduler::new(&mut state, &edges_observer, PowerSchedule::FAST),
+        );
 
         let observers = tuple_list!(edges_observer, time_observer);
 

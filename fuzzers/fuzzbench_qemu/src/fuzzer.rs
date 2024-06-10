@@ -25,7 +25,7 @@ use libafl::{
         scheduled::havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations,
         StdMOptMutator, StdScheduledMutator, Tokens,
     },
-    observers::{HitcountsMapObserver, TimeObserver, VariableMapObserver},
+    observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},
     schedulers::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, PowerQueueScheduler,
     },
@@ -37,8 +37,9 @@ use libafl::{
     Error, HasMetadata,
 };
 use libafl_bolts::{
-    current_nanos, current_time,
+    current_time,
     os::{dup2, unix_signals::Signal},
+    ownedref::OwnedMutSlice,
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::{tuple_list, Merge},
@@ -47,24 +48,25 @@ use libafl_bolts::{
 use libafl_qemu::{
     // asan::{init_with_asan, QemuAsanHelper},
     cmplog::{CmpLogObserver, QemuCmpLogHelper},
-    edges::edges_map_mut_slice,
+    edges::edges_map_mut_ptr,
     edges::QemuEdgeCoverageHelper,
-    edges::MAX_EDGES_NUM,
+    edges::{EDGES_MAP_SIZE_IN_USE, MAX_EDGES_FOUND},
     elf::EasyElf,
     filter_qemu_args,
     hooks::QemuHooks,
+    Emulator,
     GuestReg,
     //snapshot::QemuSnapshotHelper,
     MmapPerms,
     Qemu,
     QemuExecutor,
+    QemuExitError,
     QemuExitReason,
-    QemuExitReasonError,
     QemuShutdownCause,
     Regs,
 };
 #[cfg(unix)]
-use nix::{self, unistd::dup};
+use nix::unistd::dup;
 
 pub const MAX_INPUT_SIZE: usize = 1048576; // 1MB
 
@@ -256,9 +258,10 @@ fn fuzz(
     let edges_observer = unsafe {
         HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
             "edges",
-            edges_map_mut_slice(),
-            addr_of_mut!(MAX_EDGES_NUM),
+            OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), EDGES_MAP_SIZE_IN_USE),
+            addr_of_mut!(MAX_EDGES_FOUND),
         ))
+        .track_indices()
     };
 
     // Create an observation channel to keep track of the execution time
@@ -267,7 +270,7 @@ fn fuzz(
     // Create an observation channel using cmplog map
     let cmplog_observer = CmpLogObserver::new("cmplog", true);
 
-    let map_feedback = MaxMapFeedback::tracking(&edges_observer, true, false);
+    let map_feedback = MaxMapFeedback::new(&edges_observer);
 
     let calibration = CalibrationStage::new(&map_feedback);
 
@@ -277,7 +280,7 @@ fn fuzz(
         // New maximization map feedback linked to the edges observer and the feedback state
         map_feedback,
         // Time feedback, this one does not need a feedback state
-        TimeFeedback::with_observer(&time_observer)
+        TimeFeedback::new(&time_observer)
     );
 
     // A feedback to choose if an input is a solution or not
@@ -287,7 +290,7 @@ fn fuzz(
     let mut state = state.unwrap_or_else(|| {
         StdState::new(
             // RNG
-            StdRand::with_seed(current_nanos()),
+            StdRand::new(),
             // Corpus that will be evolved, we keep it in memory for performance
             InMemoryOnDiskCorpus::new(corpus_dir).unwrap(),
             // Corpus in which we store solutions (crashes in this example),
@@ -316,11 +319,10 @@ fn fuzz(
     let power = StdPowerMutationalStage::new(mutator);
 
     // A minimization+queue policy to get testcasess from the corpus
-    let scheduler = IndexesLenTimeMinimizerScheduler::new(PowerQueueScheduler::new(
-        &mut state,
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(
         &edges_observer,
-        PowerSchedule::FAST,
-    ));
+        PowerQueueScheduler::new(&mut state, &edges_observer, PowerSchedule::FAST),
+    );
 
     // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
@@ -348,7 +350,7 @@ fn fuzz(
                 Ok(QemuExitReason::End(QemuShutdownCause::HostSignal(Signal::SigInterrupt))) => {
                     process::exit(0)
                 }
-                Err(QemuExitReasonError::UnexpectedExit) => return ExitKind::Crash,
+                Err(QemuExitError::UnexpectedExit) => return ExitKind::Crash,
                 _ => panic!("Unexpected QEMU exit."),
             }
         }

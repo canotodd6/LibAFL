@@ -5,6 +5,7 @@ Have a look at `libafl_qemu` for higher-level abstractions.
 __Warning__: The documentation is built by default for `x86_64` in `usermode`. To access the documentation of other architectures or systemmode, the documentation must be rebuilt with the right features.
 */
 
+#![forbid(unexpected_cfgs)]
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -12,13 +13,21 @@ __Warning__: The documentation is built by default for `x86_64` in `usermode`. T
 #![allow(unused_mut)]
 #![allow(clippy::all)]
 #![allow(clippy::pedantic)]
+#![cfg_attr(nightly, feature(used_with_arg))]
+
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use paste::paste;
+use strum_macros::EnumIter;
 
 #[cfg(all(not(feature = "clippy"), target_os = "linux"))]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
+#[cfg(all(not(feature = "clippy"), target_os = "linux"))]
+pub use bindings::*;
 
 #[cfg(any(feature = "clippy", not(target_os = "linux")))]
+#[rustfmt::skip]
 mod x86_64_stub_bindings;
 
 #[cfg(emulation_mode = "usermode")]
@@ -28,9 +37,6 @@ pub use usermode::*;
 
 #[cfg(emulation_mode = "systemmode")]
 mod systemmode;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
-use paste::paste;
-use strum_macros::EnumIter;
 #[cfg(emulation_mode = "systemmode")]
 pub use systemmode::*;
 
@@ -98,10 +104,8 @@ macro_rules! extern_c_checked {
 
 #[cfg(target_os = "linux")]
 use core::ops::BitAnd;
-use std::{ffi::c_void, slice::from_raw_parts, str::from_utf8_unchecked};
+use std::ffi::c_void;
 
-#[cfg(all(not(feature = "clippy"), target_os = "linux"))]
-pub use bindings::*;
 #[cfg(feature = "python")]
 use pyo3::{pyclass, pymethods, IntoPy, PyObject, Python};
 #[cfg(any(feature = "clippy", not(target_os = "linux")))]
@@ -120,13 +124,14 @@ pub type GuestVirtAddr = crate::vaddr;
 
 pub type GuestHwAddrInfo = crate::qemu_plugin_hwaddr;
 
+#[derive(Debug)]
 #[repr(C)]
 #[cfg_attr(feature = "python", pyclass(unsendable))]
 pub struct MapInfo {
     start: GuestAddr,
     end: GuestAddr,
     offset: GuestAddr,
-    path: *const u8,
+    path: Option<String>,
     flags: i32,
     is_priv: i32,
 }
@@ -226,17 +231,8 @@ impl MapInfo {
     }
 
     #[must_use]
-    pub fn path(&self) -> Option<&str> {
-        if self.path.is_null() {
-            None
-        } else {
-            unsafe {
-                Some(from_utf8_unchecked(from_raw_parts(
-                    self.path,
-                    strlen(self.path),
-                )))
-            }
-        }
+    pub fn path(&self) -> Option<&String> {
+        self.path.as_ref()
     }
 
     #[must_use]

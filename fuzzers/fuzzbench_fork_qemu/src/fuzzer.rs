@@ -26,7 +26,7 @@ use libafl::{
         scheduled::havoc_mutations, token_mutations::I2SRandReplace, tokens_mutations,
         StdMOptMutator, StdScheduledMutator, Tokens,
     },
-    observers::{ConstMapObserver, HitcountsMapObserver, TimeObserver},
+    observers::{CanTrack, ConstMapObserver, HitcountsMapObserver, TimeObserver},
     schedulers::{
         powersched::PowerSchedule, IndexesLenTimeMinimizerScheduler, PowerQueueScheduler,
     },
@@ -38,24 +38,24 @@ use libafl::{
     Error, HasMetadata,
 };
 use libafl_bolts::{
-    current_nanos, current_time,
+    current_time,
     os::{dup2, unix_signals::Signal},
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::{tuple_list, Merge},
-    AsMutSlice, AsSlice,
+    AsSlice, AsSliceMut,
 };
 use libafl_qemu::{
     cmplog::{CmpLogMap, CmpLogObserver, QemuCmpLogChildHelper},
-    edges::{QemuEdgeCoverageChildHelper, EDGES_MAP_PTR, EDGES_MAP_SIZE},
+    edges::{QemuEdgeCoverageChildHelper, EDGES_MAP_PTR, EDGES_MAP_SIZE_IN_USE},
     elf::EasyElf,
     filter_qemu_args,
     hooks::QemuHooks,
-    GuestReg, MmapPerms, Qemu, QemuExitReason, QemuExitReasonError, QemuForkExecutor,
-    QemuShutdownCause, Regs,
+    GuestReg, MmapPerms, Qemu, QemuExitError, QemuExitReason, QemuForkExecutor, QemuShutdownCause,
+    Regs,
 };
 #[cfg(unix)]
-use nix::{self, unistd::dup};
+use nix::unistd::dup;
 
 /// The fuzzer main
 pub fn main() {
@@ -198,25 +198,22 @@ fn fuzz(
     let file_null = File::open("/dev/null")?;
 
     // 'While the stats are state, they are usually used in the broker - which is likely never restarted
-    let monitor = SimpleMonitor::with_user_monitor(
-        |s| {
-            #[cfg(unix)]
-            writeln!(&mut stdout_cpy, "{s}").unwrap();
-            #[cfg(windows)]
-            println!("{s}");
-            writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
-        },
-        true,
-    );
+    let monitor = SimpleMonitor::with_user_monitor(|s| {
+        #[cfg(unix)]
+        writeln!(&mut stdout_cpy, "{s}").unwrap();
+        #[cfg(windows)]
+        println!("{s}");
+        writeln!(log.borrow_mut(), "{:?} {s}", current_time()).unwrap();
+    });
 
     let mut shmem_provider = StdShMemProvider::new()?;
 
-    let mut edges_shmem = shmem_provider.new_shmem(EDGES_MAP_SIZE).unwrap();
-    let edges = edges_shmem.as_mut_slice();
+    let mut edges_shmem = shmem_provider.new_shmem(EDGES_MAP_SIZE_IN_USE).unwrap();
+    let edges = edges_shmem.as_slice_mut();
     unsafe { EDGES_MAP_PTR = edges.as_mut_ptr() };
 
     let mut cmp_shmem = shmem_provider.uninit_on_shmem::<CmpLogMap>().unwrap();
-    let cmplog = cmp_shmem.as_mut_slice();
+    let cmplog = cmp_shmem.as_slice_mut();
 
     // Beginning of a page should be properly aligned.
     #[allow(clippy::cast_ptr_alignment)]
@@ -238,10 +235,11 @@ fn fuzz(
 
     // Create an observation channel using the coverage map
     let edges_observer = unsafe {
-        HitcountsMapObserver::new(ConstMapObserver::<_, EDGES_MAP_SIZE>::from_mut_ptr(
+        HitcountsMapObserver::new(ConstMapObserver::<_, EDGES_MAP_SIZE_IN_USE>::from_mut_ptr(
             "edges",
             edges.as_mut_ptr(),
         ))
+        .track_indices()
     };
 
     // Create an observation channel to keep track of the execution time
@@ -250,7 +248,7 @@ fn fuzz(
     // Create an observation channel using cmplog map
     let cmplog_observer = unsafe { CmpLogObserver::with_map_ptr("cmplog", cmplog_map_ptr, true) };
 
-    let map_feedback = MaxMapFeedback::tracking(&edges_observer, true, false);
+    let map_feedback = MaxMapFeedback::new(&edges_observer);
 
     let calibration = CalibrationStage::new(&map_feedback);
 
@@ -260,7 +258,7 @@ fn fuzz(
         // New maximization map feedback linked to the edges observer and the feedback state
         map_feedback,
         // Time feedback, this one does not need a feedback state
-        TimeFeedback::with_observer(&time_observer)
+        TimeFeedback::new(&time_observer)
     );
 
     // A feedback to choose if an input is a solution or not
@@ -270,7 +268,7 @@ fn fuzz(
     let mut state = state.unwrap_or_else(|| {
         StdState::new(
             // RNG
-            StdRand::with_seed(current_nanos()),
+            StdRand::new(),
             // Corpus that will be evolved, we keep it in memory for performance
             InMemoryOnDiskCorpus::new(corpus_dir).unwrap(),
             // Corpus in which we store solutions (crashes in this example),
@@ -299,11 +297,10 @@ fn fuzz(
     let power = StdPowerMutationalStage::new(mutator);
 
     // A minimization+queue policy to get testcasess from the corpus
-    let scheduler = IndexesLenTimeMinimizerScheduler::new(PowerQueueScheduler::new(
-        &mut state,
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(
         &edges_observer,
-        PowerSchedule::FAST,
-    ));
+        PowerQueueScheduler::new(&mut state, &edges_observer, PowerSchedule::FAST),
+    );
 
     // A fuzzer with feedbacks and a corpus scheduler
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
@@ -331,7 +328,7 @@ fn fuzz(
                 Ok(QemuExitReason::End(QemuShutdownCause::HostSignal(Signal::SigInterrupt))) => {
                     process::exit(0)
                 }
-                Err(QemuExitReasonError::UnexpectedExit) => return ExitKind::Crash,
+                Err(QemuExitError::UnexpectedExit) => return ExitKind::Crash,
                 _ => panic!("Unexpected QEMU exit."),
             }
         }

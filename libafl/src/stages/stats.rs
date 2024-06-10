@@ -1,7 +1,7 @@
 //! Stage to compute/report AFL stats
 
 #[cfg(feature = "std")]
-use alloc::string::ToString;
+use alloc::{borrow::Cow, string::ToString};
 use core::{marker::PhantomData, time::Duration};
 
 use libafl_bolts::current_time;
@@ -9,7 +9,7 @@ use libafl_bolts::current_time;
 use serde_json::json;
 
 use crate::{
-    corpus::{Corpus, HasCurrentCorpusIdx},
+    corpus::{Corpus, HasCurrentCorpusId},
     events::EventFirer,
     schedulers::minimizer::IsFavoredMetadata,
     stages::Stage,
@@ -24,12 +24,7 @@ use crate::{
 
 /// The [`AflStatsStage`] is a simple stage that computes and reports some stats.
 #[derive(Debug, Clone)]
-pub struct AflStatsStage<E, EM, Z>
-where
-    E: UsesState,
-    EM: EventFirer<State = E::State>,
-    Z: UsesState<State = E::State>,
-{
+pub struct AflStatsStage<E, EM, Z> {
     // the number of testcases that have been fuzzed
     has_fuzzed_size: usize,
     // the number of "favored" testcases
@@ -49,8 +44,6 @@ where
 impl<E, EM, Z> UsesState for AflStatsStage<E, EM, Z>
 where
     E: UsesState,
-    EM: EventFirer<State = E::State>,
-    Z: UsesState<State = E::State>,
 {
     type State = E::State;
 }
@@ -58,18 +51,18 @@ where
 impl<E, EM, Z> Stage<E, EM, Z> for AflStatsStage<E, EM, Z>
 where
     E: UsesState,
-    EM: EventFirer<State = E::State>,
-    Z: UsesState<State = E::State>,
-    E::State: HasImported + HasCorpus + HasMetadata,
+    EM: EventFirer<State = Self::State>,
+    Z: UsesState<State = Self::State>,
+    Self::State: HasImported + HasCorpus + HasMetadata,
 {
     fn perform(
         &mut self,
         _fuzzer: &mut Z,
         _executor: &mut E,
-        state: &mut E::State,
+        state: &mut Self::State,
         _manager: &mut EM,
     ) -> Result<(), Error> {
-        let Some(corpus_idx) = state.current_corpus_idx()? else {
+        let Some(corpus_idx) = state.current_corpus_id()? else {
             return Err(Error::illegal_state(
                 "state is not currently processing a corpus index",
             ));
@@ -109,9 +102,9 @@ where
                 _manager.fire(
                     state,
                     Event::UpdateUserStats {
-                        name: "AflStats".to_string(),
+                        name: Cow::from("AflStats"),
                         value: UserStats::new(
-                            UserStatsValue::String(json.to_string()),
+                            UserStatsValue::String(Cow::from(json.to_string())),
                             AggregatorOps::None,
                         ),
                         phantom: PhantomData,
@@ -145,13 +138,7 @@ where
     }
 }
 
-impl<E, EM, Z> AflStatsStage<E, EM, Z>
-where
-    E: UsesState,
-    EM: EventFirer<State = E::State>,
-    Z: UsesState<State = E::State>,
-    E::State: HasImported + HasCorpus + HasMetadata,
-{
+impl<E, EM, Z> AflStatsStage<E, EM, Z> {
     /// create a new instance of the [`AflStatsStage`]
     #[must_use]
     pub fn new(interval: Duration) -> Self {
@@ -162,13 +149,7 @@ where
     }
 }
 
-impl<E, EM, Z> Default for AflStatsStage<E, EM, Z>
-where
-    E: UsesState,
-    EM: EventFirer<State = E::State>,
-    Z: UsesState<State = E::State>,
-    E::State: HasImported + HasCorpus + HasMetadata,
-{
+impl<E, EM, Z> Default for AflStatsStage<E, EM, Z> {
     /// the default instance of the [`AflStatsStage`]
     #[must_use]
     fn default() -> Self {

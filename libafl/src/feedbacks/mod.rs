@@ -4,39 +4,29 @@
 
 // TODO: make S of Feedback<S> an associated type when specialisation + AT is stable
 
-pub mod map;
-pub use map::*;
-
-pub mod differential;
-pub use differential::DiffFeedback;
-#[cfg(feature = "std")]
-pub mod concolic;
-#[cfg(feature = "std")]
-pub use concolic::ConcolicFeedback;
-
-#[cfg(feature = "std")]
-pub mod new_hash_feedback;
-#[cfg(feature = "std")]
-pub use new_hash_feedback::NewHashFeedback;
-#[cfg(feature = "std")]
-pub use new_hash_feedback::NewHashFeedbackMetadata;
-
-#[cfg(feature = "nautilus")]
-pub mod nautilus;
-pub mod transferred;
-
-/// The module for list feedback
-pub mod list;
-use alloc::string::{String, ToString};
+use alloc::borrow::Cow;
+#[cfg(feature = "track_hit_feedbacks")]
+use alloc::vec::Vec;
 use core::{
     fmt::{self, Debug, Formatter},
     marker::PhantomData,
 };
 
-use libafl_bolts::Named;
+#[cfg(feature = "std")]
+pub use concolic::ConcolicFeedback;
+pub use differential::DiffFeedback;
+use libafl_bolts::{
+    tuples::{Handle, Handled, MatchNameRef},
+    Named,
+};
 pub use list::*;
+pub use map::*;
 #[cfg(feature = "nautilus")]
 pub use nautilus::*;
+#[cfg(feature = "std")]
+pub use new_hash_feedback::NewHashFeedback;
+#[cfg(feature = "std")]
+pub use new_hash_feedback::NewHashFeedbackMetadata;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,6 +37,22 @@ use crate::{
     state::State,
     Error,
 };
+#[cfg(feature = "std")]
+pub mod concolic;
+#[cfg(feature = "std")]
+/// The module for `CustomFilenameToTestcaseFeedback`
+pub mod custom_filename;
+pub mod differential;
+/// The module for list feedback
+pub mod list;
+pub mod map;
+#[cfg(feature = "nautilus")]
+pub mod nautilus;
+#[cfg(feature = "std")]
+pub mod new_hash_feedback;
+#[cfg(feature = "std")]
+pub mod stdio;
+pub mod transferred;
 
 /// Feedbacks evaluate the observers.
 /// Basically, they reduce the information provided by an observer to a value,
@@ -109,6 +115,21 @@ where
         ret
     }
 
+    /// CUT MY LIFE INTO PIECES; THIS IS MY LAST [`Feedback::is_interesting`] run
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error>;
+
+    /// Append this [`Feedback`]'s name if [`Feedback::last_result`] is true
+    /// If you have any nested Feedbacks, you must call this function on them if relevant.
+    /// See the implementations of [`CombinedFeedback`]
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(&self, list: &mut Vec<Cow<'static, str>>) -> Result<(), Error> {
+        if self.last_result()? {
+            list.push(self.name().clone());
+        }
+        Ok(())
+    }
+
     /// Append to the testcase the generated metadata in case of a new corpus item
     #[inline]
     #[allow(unused_variables)]
@@ -134,9 +155,12 @@ where
 }
 
 /// Has an associated observer name (mostly used to retrieve the observer with `MatchName` from an `ObserverTuple`)
-pub trait HasObserverName {
+pub trait HasObserverHandle {
+    /// The observer for which we hold a reference
+    type Observer: ?Sized;
+
     /// The name associated with the observer
-    fn observer_name(&self) -> &str;
+    fn observer_handle(&self) -> &Handle<Self::Observer>;
 }
 
 /// A combined feedback consisting of multiple [`Feedback`]s
@@ -152,7 +176,7 @@ where
     pub first: A,
     /// Second [`Feedback`]
     pub second: B,
-    name: String,
+    name: Cow<'static, str>,
     phantom: PhantomData<(S, FL)>,
 }
 
@@ -163,8 +187,8 @@ where
     FL: FeedbackLogic<A, B, S>,
     S: State,
 {
-    fn name(&self) -> &str {
-        self.name.as_ref()
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
     }
 }
 
@@ -177,7 +201,12 @@ where
 {
     /// Create a new combined feedback
     pub fn new(first: A, second: B) -> Self {
-        let name = format!("{} ({},{})", FL::name(), first.name(), second.name());
+        let name = Cow::from(format!(
+            "{} ({},{})",
+            FL::name(),
+            first.name(),
+            second.name()
+        ));
         Self {
             first,
             second,
@@ -199,7 +228,14 @@ where
         self.second.init_state(state)?;
         Ok(())
     }
-
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        FL::last_result(&self.first, &self.second)
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(&self, list: &mut Vec<Cow<'static, str>>) -> Result<(), Error> {
+        FL::append_hit_feedbacks(&self.first, &self.second, list)
+    }
     #[allow(clippy::wrong_self_convention)]
     fn is_interesting<EM, OT>(
         &mut self,
@@ -274,6 +310,22 @@ where
     }
 }
 
+impl<A, B, FL, S, T> FeedbackFactory<CombinedFeedback<A, B, FL, S>, T>
+    for CombinedFeedback<A, B, FL, S>
+where
+    A: Feedback<S> + FeedbackFactory<A, T>,
+    B: Feedback<S> + FeedbackFactory<B, T>,
+    FL: FeedbackLogic<A, B, S>,
+    S: State,
+{
+    fn create_feedback(&self, ctx: &T) -> CombinedFeedback<A, B, FL, S> {
+        CombinedFeedback::new(
+            self.first.create_feedback(ctx),
+            self.second.create_feedback(ctx),
+        )
+    }
+}
+
 /// Logical combination of two feedbacks
 pub trait FeedbackLogic<A, B, S>: 'static
 where
@@ -298,6 +350,20 @@ where
         EM: EventFirer<State = S>,
         OT: ObserversTuple<S>;
 
+    /// Get the result of the last `Self::is_interesting` run
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(first: &A, second: &B) -> Result<bool, Error>;
+
+    /// Append this [`Feedback`]'s name if [`Feedback::last_result`] is true
+    /// If you have any nested Feedbacks, you must call this function on them if relevant.
+    /// See the implementations of [`CombinedFeedback`]
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(
+        first: &A,
+        second: &B,
+        list: &mut Vec<Cow<'static, str>>,
+    ) -> Result<(), Error>;
+
     /// If this pair is interesting (with introspection features enabled)
     #[cfg(feature = "introspection")]
     #[allow(clippy::too_many_arguments)]
@@ -317,56 +383,19 @@ where
 
 /// Factory for feedbacks which should be sensitive to an existing context, e.g. observer(s) from a
 /// specific execution
-pub trait FeedbackFactory<F, S, T>
-where
-    F: Feedback<S>,
-    S: State,
-{
+pub trait FeedbackFactory<F, T> {
     /// Create the feedback from the provided context
     fn create_feedback(&self, ctx: &T) -> F;
 }
 
-impl<FE, FU, S, T> FeedbackFactory<FE, S, T> for FU
+impl<FE, FU, T> FeedbackFactory<FE, T> for FU
 where
     FU: Fn(&T) -> FE,
-    FE: Feedback<S>,
-    S: State,
 {
     fn create_feedback(&self, ctx: &T) -> FE {
         self(ctx)
     }
 }
-
-/// A feedback factory which merely invokes `::default()` for the feedback type provided
-#[derive(Default, Debug, Copy, Clone)]
-pub struct DefaultFeedbackFactory<F>
-where
-    F: Default,
-{
-    phantom: PhantomData<F>,
-}
-
-impl<F> DefaultFeedbackFactory<F>
-where
-    F: Default,
-{
-    /// Create the feedback factory
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl<F, S, T> FeedbackFactory<F, S, T> for DefaultFeedbackFactory<F>
-where
-    F: Feedback<S> + Default,
-    S: State,
-{
-    fn create_feedback(&self, _ctx: &T) -> F {
-        F::default()
-    }
-}
-
 /// Eager `OR` combination of two feedbacks
 #[derive(Debug, Clone)]
 pub struct LogicEagerOr {}
@@ -409,6 +438,27 @@ where
         let a = first.is_interesting(state, manager, input, observers, exit_kind)?;
         let b = second.is_interesting(state, manager, input, observers, exit_kind)?;
         Ok(a || b)
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(first: &A, second: &B) -> Result<bool, Error> {
+        Ok(first.last_result()? || second.last_result()?)
+    }
+    /// Note: Eager OR's hit feedbacks will behave like Fast OR
+    /// because the second feedback will not have contributed to the result.
+    /// Set the second feedback as the first (A, B) vs (B, A)
+    /// to "prioritize" the result in case of Eager OR.
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(
+        first: &A,
+        second: &B,
+        list: &mut Vec<Cow<'static, str>>,
+    ) -> Result<(), Error> {
+        if first.last_result()? {
+            first.append_hit_feedbacks(list)?;
+        } else if second.last_result()? {
+            second.append_hit_feedbacks(list)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "introspection")]
@@ -462,6 +512,28 @@ where
         }
 
         second.is_interesting(state, manager, input, observers, exit_kind)
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(first: &A, second: &B) -> Result<bool, Error> {
+        if first.last_result()? {
+            return Ok(true);
+        }
+
+        // The second must have run if the first wasn't interesting
+        second.last_result()
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(
+        first: &A,
+        second: &B,
+        list: &mut Vec<Cow<'static, str>>,
+    ) -> Result<(), Error> {
+        if first.last_result()? {
+            first.append_hit_feedbacks(list)?;
+        } else if second.last_result()? {
+            second.append_hit_feedbacks(list)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "introspection")]
@@ -517,6 +589,23 @@ where
         Ok(a && b)
     }
 
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(first: &A, second: &B) -> Result<bool, Error> {
+        Ok(first.last_result()? && second.last_result()?)
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(
+        first: &A,
+        second: &B,
+        list: &mut Vec<Cow<'static, str>>,
+    ) -> Result<(), Error> {
+        if first.last_result()? && second.last_result()? {
+            first.append_hit_feedbacks(list)?;
+            second.append_hit_feedbacks(list)?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "introspection")]
     fn is_pair_interesting_introspection<EM, OT>(
         first: &mut A,
@@ -568,6 +657,30 @@ where
         }
 
         second.is_interesting(state, manager, input, observers, exit_kind)
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(first: &A, second: &B) -> Result<bool, Error> {
+        if !first.last_result()? {
+            return Ok(false);
+        }
+
+        // The second must have run if the first wasn't interesting
+        second.last_result()
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn append_hit_feedbacks(
+        first: &A,
+        second: &B,
+        list: &mut Vec<Cow<'static, str>>,
+    ) -> Result<(), Error> {
+        if first.last_result()? {
+            first.append_hit_feedbacks(list)?;
+        } else if second.last_result()? {
+            second.append_hit_feedbacks(list)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "introspection")]
@@ -623,7 +736,7 @@ where
     /// The feedback to invert
     pub first: A,
     /// The name
-    name: String,
+    name: Cow<'static, str>,
     phantom: PhantomData<S>,
 }
 
@@ -687,6 +800,11 @@ where
     fn discard_metadata(&mut self, state: &mut S, input: &S::Input) -> Result<(), Error> {
         self.first.discard_metadata(state, input)
     }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        Ok(!self.first.last_result()?)
+    }
 }
 
 impl<A, S> Named for NotFeedback<A, S>
@@ -695,7 +813,7 @@ where
     S: State,
 {
     #[inline]
-    fn name(&self) -> &str {
+    fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }
@@ -707,7 +825,7 @@ where
 {
     /// Creates a new [`NotFeedback`].
     pub fn new(first: A) -> Self {
-        let name = format!("Not({})", first.name());
+        let name = Cow::from(format!("Not({})", first.name()));
         Self {
             first,
             name,
@@ -788,11 +906,19 @@ where
     {
         Ok(false)
     }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
 }
 
 /// A [`CrashFeedback`] reports as interesting if the target crashed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CrashFeedback {}
+pub struct CrashFeedback {
+    #[cfg(feature = "track_hit_feedbacks")]
+    // The previous run's result of `Self::is_interesting`
+    last_result: Option<bool>,
+}
 
 impl<S> Feedback<S> for CrashFeedback
 where
@@ -811,18 +937,25 @@ where
         EM: EventFirer<State = S>,
         OT: ObserversTuple<S>,
     {
-        if let ExitKind::Crash = exit_kind {
-            Ok(true)
-        } else {
-            Ok(false)
+        let res = matches!(exit_kind, ExitKind::Crash);
+        #[cfg(feature = "track_hit_feedbacks")]
+        {
+            self.last_result = Some(res);
         }
+        Ok(res)
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        self.last_result.ok_or(premature_last_result_err())
     }
 }
 
 impl Named for CrashFeedback {
     #[inline]
-    fn name(&self) -> &str {
-        "CrashFeedback"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("CrashFeedback");
+        &NAME
     }
 }
 
@@ -830,7 +963,10 @@ impl CrashFeedback {
     /// Creates a new [`CrashFeedback`]
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            #[cfg(feature = "track_hit_feedbacks")]
+            last_result: None,
+        }
     }
 }
 
@@ -840,12 +976,19 @@ impl Default for CrashFeedback {
     }
 }
 
-/// A feedback factory for crash feedbacks
-pub type CrashFeedbackFactory = DefaultFeedbackFactory<CrashFeedback>;
+impl<T> FeedbackFactory<CrashFeedback, T> for CrashFeedback {
+    fn create_feedback(&self, _ctx: &T) -> CrashFeedback {
+        CrashFeedback::new()
+    }
+}
 
 /// A [`TimeoutFeedback`] reduces the timeout value of a run.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct TimeoutFeedback {}
+pub struct TimeoutFeedback {
+    #[cfg(feature = "track_hit_feedbacks")]
+    // The previous run's result of `Self::is_interesting`
+    last_result: Option<bool>,
+}
 
 impl<S> Feedback<S> for TimeoutFeedback
 where
@@ -864,18 +1007,25 @@ where
         EM: EventFirer<State = S>,
         OT: ObserversTuple<S>,
     {
-        if let ExitKind::Timeout = exit_kind {
-            Ok(true)
-        } else {
-            Ok(false)
+        let res = matches!(exit_kind, ExitKind::Timeout);
+        #[cfg(feature = "track_hit_feedbacks")]
+        {
+            self.last_result = Some(res);
         }
+        Ok(res)
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        self.last_result.ok_or(premature_last_result_err())
     }
 }
 
 impl Named for TimeoutFeedback {
     #[inline]
-    fn name(&self) -> &str {
-        "TimeoutFeedback"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("TimeoutFeedback");
+        &NAME
     }
 }
 
@@ -883,7 +1033,10 @@ impl TimeoutFeedback {
     /// Returns a new [`TimeoutFeedback`].
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            #[cfg(feature = "track_hit_feedbacks")]
+            last_result: None,
+        }
     }
 }
 
@@ -894,14 +1047,88 @@ impl Default for TimeoutFeedback {
 }
 
 /// A feedback factory for timeout feedbacks
-pub type TimeoutFeedbackFactory = DefaultFeedbackFactory<TimeoutFeedback>;
+impl<T> FeedbackFactory<TimeoutFeedback, T> for TimeoutFeedback {
+    fn create_feedback(&self, _ctx: &T) -> TimeoutFeedback {
+        TimeoutFeedback::new()
+    }
+}
+
+/// A [`DiffExitKindFeedback`] checks if there is a difference in the [`crate::executors::ExitKind`]s in a [`crate::executors::DiffExecutor`].
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DiffExitKindFeedback {
+    #[cfg(feature = "track_hit_feedbacks")]
+    // The previous run's result of `Self::is_interesting`
+    last_result: Option<bool>,
+}
+
+impl<S> Feedback<S> for DiffExitKindFeedback
+where
+    S: State,
+{
+    #[allow(clippy::wrong_self_convention)]
+    fn is_interesting<EM, OT>(
+        &mut self,
+        _state: &mut S,
+        _manager: &mut EM,
+        _input: &S::Input,
+        _observers: &OT,
+        exit_kind: &ExitKind,
+    ) -> Result<bool, Error>
+    where
+        EM: EventFirer<State = S>,
+        OT: ObserversTuple<S>,
+    {
+        let res = matches!(exit_kind, ExitKind::Diff { .. });
+        #[cfg(feature = "track_hit_feedbacks")]
+        {
+            self.last_result = Some(res);
+        }
+        Ok(res)
+    }
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        self.last_result.ok_or(premature_last_result_err())
+    }
+}
+
+impl Named for DiffExitKindFeedback {
+    #[inline]
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("DiffExitKindFeedback");
+        &NAME
+    }
+}
+
+impl DiffExitKindFeedback {
+    /// Returns a new [`DiffExitKindFeedback`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "track_hit_feedbacks")]
+            last_result: None,
+        }
+    }
+}
+
+impl Default for DiffExitKindFeedback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A feedback factory for diff exit kind feedbacks
+impl<T> FeedbackFactory<DiffExitKindFeedback, T> for DiffExitKindFeedback {
+    fn create_feedback(&self, _ctx: &T) -> DiffExitKindFeedback {
+        DiffExitKindFeedback::new()
+    }
+}
 
 /// Nop feedback that annotates execution time in the new testcase, if any
 /// for this Feedback, the testcase is never interesting (use with an OR).
 /// It decides, if the given [`TimeObserver`] value of a run is interesting.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TimeFeedback {
-    name: String,
+    observer_handle: Handle<TimeObserver>,
 }
 
 impl<S> Feedback<S> for TimeFeedback
@@ -938,7 +1165,7 @@ where
         OT: ObserversTuple<S>,
         EM: EventFirer<State = S>,
     {
-        let observer = observers.match_name::<TimeObserver>(self.name()).unwrap();
+        let observer = observers.get(&self.observer_handle).unwrap();
         *testcase.exec_time_mut() = *observer.last_runtime();
         Ok(())
     }
@@ -948,29 +1175,26 @@ where
     fn discard_metadata(&mut self, _state: &mut S, _input: &S::Input) -> Result<(), Error> {
         Ok(())
     }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
 }
 
 impl Named for TimeFeedback {
     #[inline]
-    fn name(&self) -> &str {
-        self.name.as_str()
+    fn name(&self) -> &Cow<'static, str> {
+        self.observer_handle.name()
     }
 }
 
 impl TimeFeedback {
-    /// Creates a new [`TimeFeedback`], deciding if the value of a [`TimeObserver`] with the given `name` of a run is interesting.
-    #[must_use]
-    pub fn new(name: &'static str) -> Self {
-        Self {
-            name: name.to_string(),
-        }
-    }
-
     /// Creates a new [`TimeFeedback`], deciding if the given [`TimeObserver`] value of a run is interesting.
     #[must_use]
-    pub fn with_observer(observer: &TimeObserver) -> Self {
+    pub fn new(observer: &TimeObserver) -> Self {
         Self {
-            name: observer.name().to_string(),
+            observer_handle: observer.handle(),
         }
     }
 }
@@ -1003,17 +1227,20 @@ where
         EM: EventFirer<State = S>,
         OT: ObserversTuple<S>,
     {
-        Ok(match self {
-            ConstFeedback::True => true,
-            ConstFeedback::False => false,
-        })
+        Ok((*self).into())
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
+        Ok((*self).into())
     }
 }
 
 impl Named for ConstFeedback {
     #[inline]
-    fn name(&self) -> &str {
-        "ConstFeedback"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("ConstFeedback");
+        &NAME
     }
 }
 
@@ -1033,4 +1260,19 @@ impl From<bool> for ConstFeedback {
             Self::False
         }
     }
+}
+
+impl From<ConstFeedback> for bool {
+    fn from(value: ConstFeedback) -> Self {
+        match value {
+            ConstFeedback::True => true,
+            ConstFeedback::False => false,
+        }
+    }
+}
+
+#[cfg(feature = "track_hit_feedbacks")]
+/// Error if [`Feedback::last_result`] is called before the `Feedback` is actually run.
+pub(crate) fn premature_last_result_err() -> Error {
+    Error::illegal_state("last_result called before Feedback was run")
 }

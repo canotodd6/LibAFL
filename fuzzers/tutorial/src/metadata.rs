@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use libafl::{
     corpus::Testcase,
     events::EventFirer,
@@ -32,8 +34,8 @@ where
     }
 }
 
-pub type PacketLenMinimizerScheduler<CS> =
-    MinimizerScheduler<CS, PacketLenTestcaseScore, MapIndexesMetadata>;
+pub type PacketLenMinimizerScheduler<CS, O> =
+    MinimizerScheduler<CS, PacketLenTestcaseScore, MapIndexesMetadata, O>;
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct PacketLenFeedback {
@@ -78,8 +80,9 @@ where
 
 impl Named for PacketLenFeedback {
     #[inline]
-    fn name(&self) -> &str {
-        "PacketLenFeedback"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("PacketLenFeedback");
+        &NAME
     }
 }
 
